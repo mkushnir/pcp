@@ -1,7 +1,7 @@
 # pylint: disable=C0103
 """ Wrapper module for LIBPCP - the core Performace Co-Pilot API """
 #
-# Copyright (C) 2012-2015 Red Hat
+# Copyright (C) 2012-2016 Red Hat
 # Copyright (C) 2009-2012 Michael T. Werner
 #
 # This file is part of the "pcp" module, the python interfaces for the
@@ -101,7 +101,7 @@ import cpmapi as c_api
 # for interfacing with LIBPCP - the client-side C API
 import ctypes
 from ctypes import c_char, c_int, c_uint, c_long, c_char_p, c_void_p
-from ctypes import c_longlong, c_ulonglong, c_float, c_double
+from ctypes import c_float, c_double, c_int32, c_uint32, c_int64, c_uint64
 from ctypes import CDLL, POINTER, CFUNCTYPE, Structure, Union
 from ctypes import addressof, pointer, sizeof, cast, byref
 from ctypes import create_string_buffer, memmove
@@ -187,10 +187,28 @@ class pmUsageErr(Exception):
 # Section 3.5 - Performance Metric Values
 #
 
-# these hardcoded decls should be derived from <sys/time.h>
+# These hardcoded decls should be derived from <sys/time.h>, but no such
+# ctypes facility exists.  Particularly problematic is the tv_usec field
+# (which POSIX defines as having type suseconds_t) - this can be 32 bits
+# on some 64 bit platforms (hence c_long is not always correct).
+
+if c_api.SIZEOF_SUSECONDS_T == 4:
+    c_suseconds_t = c_int32
+elif c_api.SIZEOF_SUSECONDS_T == 8:
+    c_suseconds_t = c_int64
+else:
+    raise pmErr(c_api.PM_ERR_CONV, "Unexpected suseconds_t size")
+
+if c_api.SIZEOF_TIME_T == 4:
+    c_time_t = c_int32
+elif c_api.SIZEOF_TIME_T == 8:
+    c_time_t = c_int64
+else:
+    raise pmErr(c_api.PM_ERR_CONV, "Unexpected time_t size")
+
 class timeval(Structure):
-    _fields_ = [("tv_sec", c_long),
-                ("tv_usec", c_long)]
+    _fields_ = [("tv_sec", c_time_t),
+                ("tv_usec", c_suseconds_t)]
 
     def __init__(self, sec = 0, usec = 0):
         Structure.__init__(self)
@@ -227,13 +245,16 @@ class timeval(Structure):
         return None
 
 class timespec(Structure):
-    _fields_ = [("tv_sec", c_long),
+    _fields_ = [("tv_sec", c_time_t),
                 ("tv_nsec", c_long)]
 
     def __init__(self, sec = 0, nsec = 0):
         Structure.__init__(self)
         self.tv_sec = sec
-        self.tv_nsec = usec
+        self.tv_nsec = nsec
+
+    def __str__(self):
+        return "%.3f" % (float(self.tv_sec)+(float(self.tv_nsec)/1000000000.0))
 
 class tm(Structure):
     _fields_ = [("tm_sec", c_int),
@@ -264,10 +285,10 @@ class pmAtomValue(Union):
 
     Constants for specifying metric types are defined in module pmapi
     """
-    _fields_ = [("l", c_int),
-                ("ul", c_uint),
-                ("ll", c_longlong),
-                ("ull", c_ulonglong),
+    _fields_ = [("l", c_int32),
+                ("ul", c_uint32),
+                ("ll", c_int64),
+                ("ull", c_uint64),
                 ("f", c_float),
                 ("d", c_double),
                 ("cp", c_char_p),
@@ -279,9 +300,11 @@ class pmAtomValue(Union):
                   c_api.PM_TYPE_U64 : lambda x: x.ull,
                   c_api.PM_TYPE_FLOAT : lambda x: x.f,
                   c_api.PM_TYPE_DOUBLE : lambda x: x.d,
-                  c_api.PM_TYPE_STRING : lambda x: x.cp,
+                  c_api.PM_TYPE_STRING : lambda x: str(x.cp.decode('utf-8')),
                   c_api.PM_TYPE_AGGREGATE : lambda x: None,
                   c_api.PM_TYPE_AGGREGATE_STATIC : lambda x: None,
+                  c_api.PM_TYPE_EVENT : lambda x: None,
+                  c_api.PM_TYPE_HIGHRES_EVENT : lambda x: None,
                   c_api.PM_TYPE_NOSUPPORT : lambda x: None,
                   c_api.PM_TYPE_UNKNOWN : lambda x: None
             }
@@ -518,6 +541,14 @@ class pmLogLabel(Structure):
                  ("hostname", c_char * c_api.PM_LOG_MAXHOSTLEN),
                  ("tz", c_char * c_api.PM_TZ_MAXLEN) ]
 
+    def get_hostname(self):
+        """ Return the hostname from the structure as native str """
+        return str(self.hostname.decode())
+
+    def get_timezone(self):
+        """ Return the timezone from the structure as native str """
+        return str(self.tz.decode())
+
 
 ##############################################################################
 #
@@ -556,14 +587,11 @@ LIBPCP.pmTraversePMNS.argtypes = [c_char_p, traverseCB_type]
 LIBPCP.pmUnloadNameSpace.restype = c_int
 LIBPCP.pmUnloadNameSpace.argtypes = []
 
-LIBPCP.pmRegisterDerived.restype = c_char_p
-LIBPCP.pmRegisterDerived.argtypes = [c_char_p, c_char_p]
+LIBPCP.pmRegisterDerivedMetric.restype = c_int
+LIBPCP.pmRegisterDerivedMetric.argtypes = [c_char_p, c_char_p, POINTER(c_char_p)]
 
 LIBPCP.pmLoadDerivedConfig.restype = c_int
 LIBPCP.pmLoadDerivedConfig.argtypes = [c_char_p]
-
-LIBPCP.pmDerivedErrStr.restype = c_char_p
-LIBPCP.pmDerivedErrStr.argtypes = []
 
 ##
 # PMAPI Metrics Description Services
@@ -1012,6 +1040,11 @@ class pmOptions(object):
     def pmGetOptionSamples(self):	# int
         return c_api.pmGetOptionSamples()
 
+    def pmGetOptionHostZone(self):	# boolean
+        if c_api.pmGetOptionHostZone() == 0:
+            return False
+        return True
+
     def pmGetOptionTimezone(self):	# str
         return c_api.pmGetOptionTimezone()
 
@@ -1311,10 +1344,12 @@ class pmContext(object):
             name = name.encode('utf-8')
         if type(expr) != type(b''):
             expr = expr.encode('utf-8')
-        string = LIBPCP.pmRegisterDerived(name, expr)
-        if string != None:
-            failure = ['@', str(string.decode())]
-            raise pmErr(c_api.PM_ERR_GENERIC, failure)
+        errmsg = c_char_p()
+        result = LIBPCP.pmRegisterDerivedMetric(name, expr, byref(errmsg))
+        if result != 0:
+            text = str(errmsg.value.decode())
+            LIBC.free(errmsg)
+            raise pmErr(c_api.PM_ERR_CONV, text)
         status = LIBPCP.pmReconnectContext(self.ctx)
         if status < 0:
             raise pmErr(status)
@@ -1332,9 +1367,11 @@ class pmContext(object):
         if status < 0:
             raise pmErr(status)
 
+    # Deprecated, no longer needed, py wrapper uses pmRegisterDerivedMetric(3)
+    # and the exception encodes a more complete error message as a result.
     @staticmethod
     def pmDerivedErrStr():
-        """PMAPI - Return an error message if the pmRegisterDerived metric
+        """PMAPI - Return an error message if the pmRegisterDerived(3) metric
         definition cannot be parsed
         pm.pmRegisterDerived()
         """
@@ -2087,10 +2124,7 @@ class fetchgroup(object):
             """Retrieve a converted value of a fetchgroup item, if available."""
             if self.sts.value < 0:
                 raise pmErr(self.sts.value)
-            elif self.pmtype == c_api.PM_TYPE_STRING:
-                return self.value.dref(self.pmtype).decode('utf-8')
-            else:
-                return self.value.dref(self.pmtype)
+            return self.value.dref(self.pmtype)
 
 
     class fetchgroup_timestamp(object):
@@ -2151,10 +2185,7 @@ class fetchgroup(object):
                 def decode_one(self, i):
                     if self.stss[i] < 0:
                         raise pmErr(self.stss[i])
-                    elif self.pmtype == c_api.PM_TYPE_STRING:
-                        return self.values[i].dref(self.pmtype).decode('utf-8')
-                    else:
-                        return self.values[i].dref(self.pmtype)
+                    return self.values[i].dref(self.pmtype)
                 vv.append((self.icodes[i],
                            self.inames[i].decode('utf-8') if self.inames[i] else None,
                            # nested lambda for proper i capture
@@ -2195,10 +2226,7 @@ class fetchgroup(object):
                 def decode_one(self, i):
                     if self.stss[i] < 0:
                         raise pmErr(self.stss[i])
-                    if self.pmtype == c_api.PM_TYPE_STRING:
-                        return self.values[i].dref(self.pmtype).decode('utf-8')
-                    else:
-                        return self.values[i].dref(self.pmtype)
+                    return self.values[i].dref(self.pmtype)
 
                 ts = self.ctx.pmLocaltime(self.times[i].tv_sec)
                 us = int(self.times[i].tv_nsec)//1000
